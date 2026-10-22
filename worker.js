@@ -14,7 +14,7 @@ function json(data, status = 200) {
       "content-type": "application/json; charset=utf-8",
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "Content-Type",
+      "access-control-allow-headers": "Content-Type, Authorization",
       "cache-control": "no-store"
     }
   });
@@ -169,7 +169,8 @@ async function portfolio(db) {
 }
 async function route(req, env) {
   const url=new URL(req.url), path=url.pathname;
-  if(req.method==="OPTIONS") return new Response(null,{status:204,headers:{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"Content-Type"}});
+  if(req.method==="OPTIONS") return new Response(null,{status:204,headers:{"access-control-allow-origin":"*","access-control-allow-methods":"GET,POST,OPTIONS","access-control-allow-headers":"Content-Type, Authorization"}});
+  if (path.startsWith("/api/") && !authorized(req, env)) return json({error:"Non autorizzato: configura BOT_TOKEN e inserisci il token nel frontend."},401);
   await init(env.DB);
   if(path==="/api/status" && req.method==="GET") return json({ok:true,service:"crypto-momentum-paper-bot",mode:"paper-only",lastScan:await getState(env.DB,"last_scan"),lastError:await getState(env.DB,"last_error"),scanCount:Number(await getState(env.DB,"scan_count"))});
   if(path==="/api/signals" && req.method==="GET") {
