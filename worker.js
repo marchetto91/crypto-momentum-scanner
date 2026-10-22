@@ -98,6 +98,7 @@ async function init(db) {
   await db.prepare("CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, price REAL NOT NULL, score INTEGER NOT NULL, ch15 REAL, ch60 REAL, vol_rel REAL, spread REAL, resistance REAL, candidate INTEGER NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'new')").run();
   await db.prepare("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER, symbol TEXT NOT NULL, entry REAL NOT NULL, stop REAL NOT NULL, target REAL NOT NULL, size_eur REAL NOT NULL, fee_rate REAL NOT NULL, status TEXT NOT NULL DEFAULT 'open', exit REAL, pnl_eur REAL, opened_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT, FOREIGN KEY(signal_id) REFERENCES signals(id))").run();
   await db.prepare("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)").run();
+  await db.prepare("CREATE TABLE IF NOT EXISTS signal_events (id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER NOT NULL, event_type TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL)").run();
   await db.prepare("INSERT OR IGNORE INTO bot_state(key,value) VALUES ('starting_eur','150'),('last_scan',''),('last_error',''),('scan_count','0')").run();
 }
 async function setState(db,key,value) {
@@ -126,9 +127,20 @@ async function scanMarkets(db) {
     }
     results.sort((a,b)=>b.score-a.score);
     const now=new Date().toISOString();
+    await db.prepare("UPDATE signals SET status='expired' WHERE status='new' AND created_at < ?").bind(new Date(Date.now()-15*60*1000).toISOString()).run();
     for (const x of results) {
-      await db.prepare("INSERT INTO signals(symbol,price,score,ch15,ch60,vol_rel,spread,resistance,candidate,created_at,status) VALUES(?,?,?,?,?,?,?,?,?,?, 'new')")
-        .bind(x.symbol,x.price,x.score,x.ch15,x.ch60,x.volRel,x.spread,x.resistance,x.candidate?1:0,now).run();
+      const previous = await db.prepare("SELECT * FROM signals WHERE symbol=? AND status='new' ORDER BY id DESC LIMIT 1").bind(x.symbol).first();
+      if (previous && Date.now()-Date.parse(previous.created_at) < 15*60*1000) {
+        await db.prepare("UPDATE signals SET price=?,score=?,ch15=?,ch60=?,vol_rel=?,spread=?,resistance=?,candidate=?,created_at=? WHERE id=?")
+          .bind(x.price,x.score,x.ch15,x.ch60,x.volRel,x.spread,x.resistance,x.candidate?1:0,now,previous.id).run();
+        await db.prepare("INSERT INTO signal_events(signal_id,event_type,detail,created_at) VALUES(?,?,?,?)")
+          .bind(previous.id,"updated",JSON.stringify({price:x.price,score:x.score,candidate:x.candidate}),now).run();
+      } else {
+        const inserted = await db.prepare("INSERT INTO signals(symbol,price,score,ch15,ch60,vol_rel,spread,resistance,candidate,created_at,status) VALUES(?,?,?,?,?,?,?,?,?,?, 'new')")
+          .bind(x.symbol,x.price,x.score,x.ch15,x.ch60,x.volRel,x.spread,x.resistance,x.candidate?1:0,now).run();
+        if (inserted.meta?.last_row_id) await db.prepare("INSERT INTO signal_events(signal_id,event_type,detail,created_at) VALUES(?,?,?,?)")
+          .bind(inserted.meta.last_row_id,"created",JSON.stringify({price:x.price,score:x.score,candidate:x.candidate}),now).run();
+      }
     }
     // Keep only the most recent 500 signals.
     await db.prepare("DELETE FROM signals WHERE id NOT IN (SELECT id FROM signals ORDER BY id DESC LIMIT 500)").run();
@@ -188,9 +200,19 @@ async function route(req, env) {
     if(!Number.isInteger(id)||id<1) return json({error:"signalId non valido"},400);
     const sig=await env.DB.prepare("SELECT * FROM signals WHERE id=?").bind(id).first();
     if(!sig||!sig.candidate||sig.status!=="new") return json({error:"Segnale non disponibile o non più valido"},409);
+    if (!sig.created_at || Date.now()-Date.parse(sig.created_at) > 15*60*1000) {
+      await env.DB.prepare("UPDATE signals SET status='expired' WHERE id=? AND status='new'").bind(id).run();
+      return json({error:"Segnale scaduto. Attendi una nuova scansione; non inseguire il prezzo."},409);
+    }
+    const latestTickers = arr(await publicApi("get-tickers"));
+    const ticker = latestTickers.find(t => sym(t) === sig.symbol);
+    const refreshedPrice = ticker ? marketPrice(ticker) : 0;
+    if (!(refreshedPrice > 0)) return json({error:"Prezzo aggiornato non disponibile; apertura bloccata."},409);
+    const priceDrift = Math.abs(refreshedPrice / Number(sig.price) - 1);
+    if (priceDrift > 0.01) return json({error:"Prezzo variato oltre l'1% dal segnale. Attendi una nuova scansione e conferma il setup aggiornato."},409);
     const already=await env.DB.prepare("SELECT COUNT(*) n FROM trades WHERE status='open'").first();
     if(Number(already?.n)>=MAX_OPEN_TRADES) return json({error:"Massimo 3 posizioni aperte"},409);
-    const openAt=Number(sig.price), stop=Math.min(Number(sig.resistance)*.99,openAt*.97);
+    const openAt=refreshedPrice, stop=Math.min(Number(sig.resistance)*.99,openAt*.97);
     if(!(openAt>stop&&stop>0)) return json({error:"Prezzi non validi per lo stop"},400);
     const size=positionSize({capital:STARTING_EUR,riskEur:MAX_RISK_EUR,entry:openAt,stop,feeRate:FEE_RATE});
     if(!(size>0)) return json({error:"Dimensione posizione non valida"},400);
@@ -201,6 +223,7 @@ async function route(req, env) {
     const result=await env.DB.prepare("INSERT INTO trades(signal_id,symbol,entry,stop,target,size_eur,fee_rate,status,opened_at) VALUES(?,?,?,?,?,?,?,'open',?)")
       .bind(id,sig.symbol,openAt,stop,target,size,FEE_RATE,now).run();
     await env.DB.prepare("UPDATE signals SET status='used' WHERE id=?").bind(id).run();
+    await env.DB.prepare("INSERT INTO signal_events(signal_id,event_type,detail,created_at) VALUES(?,?,?,?)").bind(id,"paper_trade_opened",JSON.stringify({tradeId:result.meta?.last_row_id,entry:openAt,sizeEur:size}),now).run();
     return json({ok:true,tradeId:result.meta?.last_row_id,symbol:sig.symbol,entry:openAt,stop,target,sizeEur:size,mode:"paper"},201);
   }
   return json({error:"Endpoint non trovato"},404);
