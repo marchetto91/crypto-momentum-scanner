@@ -1,0 +1,10 @@
+{
+  "name": "Crypto Momentum Scanner",
+  "short_name": "Momentum Scanner",
+  "description": "Scanner crypto sperimentale con paper trading e gestione del rischio.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#090e1b",
+  "theme_color": "#0b1020"
+}
