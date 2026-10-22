@@ -2,6 +2,9 @@ const API = "https://api.crypto.com/exchange/v1/public/";
 const STARTING_EUR = 150;
 const FEE_RATE = 0.003; // 0.3% per side, conservative demo estimate
 const MAX_MARKETS = 25;
+const MAX_OPEN_TRADES = 3;
+const MAX_RISK_EUR = STARTING_EUR * 0.02;
+const DAILY_LOSS_LIMIT_EUR = STARTING_EUR * 0.05;
 const CANDLES = 30;
 
 function json(data, status = 200) {
@@ -17,6 +20,29 @@ function json(data, status = 200) {
   });
 }
 function sym(x) { return x?.instrument_name || x?.i || x?.symbol || ""; }
+function marketPrice(t) {
+  const last = Number(t?.a);
+  if (Number.isFinite(last) && last > 0) return last;
+  const bid = Number(t?.b), ask = Number(t?.k);
+  if (Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0) return (bid + ask) / 2;
+  return 0;
+}
+function isSpotInstrument(x) {
+  const type = String(x?.inst_type || x?.type || x?.instrument_type || "").toUpperCase();
+  const symbol = sym(x).toUpperCase();
+  if (!symbol || symbol.includes("-PERP") || symbol.includes("-FUT") || symbol.includes("-OPT")) return false;
+  if (type) return ["CCY_PAIR", "SPOT", "SPOT_TRADING"].includes(type);
+  return symbol.includes("_") && !symbol.includes("-");
+}
+function positionSize({capital=STARTING_EUR, riskEur=MAX_RISK_EUR, entry, stop, feeRate=FEE_RATE}) {
+  if (!(capital > 0 && riskEur > 0 && entry > stop && stop > 0 && feeRate >= 0)) return 0;
+  const lossFraction = (entry - stop) / entry + feeRate * 2;
+  return lossFraction > 0 ? Math.min(capital, riskEur / lossFraction) : 0;
+}
+function authorized(req, env) {
+  const token = env?.BOT_TOKEN;
+  return Boolean(token) && req.headers.get("authorization") === "Bearer " + token;
+}
 function num(x, ...keys) {
   for (const k of keys) if (x?.[k] !== undefined && x[k] !== null && x[k] !== "") {
     const n = Number(x[k]); if (Number.isFinite(n)) return n;
@@ -86,10 +112,10 @@ async function scanMarkets(db) {
   try {
     const [insR,tickR] = await Promise.all([publicApi("get-instruments"),publicApi("get-tickers")]);
     const instruments = arr(insR), tickers = arr(tickR);
-    const spot = new Set(instruments.filter(x => String(x.inst_type || x.type || "").toLowerCase().includes("spot") || !x.inst_type).map(sym));
+    const spot = new Set(instruments.filter(isSpotInstrument).map(sym));
     const eligible = tickers.filter(t => {
       const s=sym(t);
-      return (spot.size===0 || spot.has(s)) && (s.endsWith("_EUR") || s.endsWith("_USDT")) && num(t,"a","k")>0;
+      return spot.has(s) && (s.endsWith("_EUR") || s.endsWith("_USDT")) && marketPrice(t)>0;
     }).sort((a,b)=>num(b,"v")-num(a,"v")).slice(0,MAX_MARKETS);
     const results=[];
     for (let i=0;i<eligible.length;i+=5) {
@@ -118,12 +144,12 @@ async function scanMarkets(db) {
 }
 async function manageOpenTrades(db,tickers) {
   const open=await db.prepare("SELECT * FROM trades WHERE status='open'").all();
-  const prices=new Map(tickers.map(t=>[sym(t),num(t,"a","k","c")]));
+  const prices=new Map(tickers.map(t=>[sym(t),marketPrice(t)]));
   for (const t of open.results || []) {
     const price=prices.get(t.symbol); if (!(price>0)) continue;
     let exit=null,reason="";
-    if(price<=t.stop){exit=t.stop;reason="stop"}
-    else if(price>=t.target){exit=t.target;reason="target"}
+    if(price<=t.stop){exit=price;reason=price<t.stop?"stop_gap":"stop"}
+    else if(price>=t.target){exit=price;reason=price>t.target?"target_gap":"target"}
     if(exit!==null){
       const pnl=t.size_eur*(exit/t.entry-1)-t.size_eur*t.fee_rate*2;
       await db.prepare("UPDATE trades SET status='closed',exit=?,pnl_eur=?,closed_at=?,close_reason=? WHERE id=? AND status='open'")
@@ -155,17 +181,21 @@ async function route(req, env) {
     const r=await env.DB.prepare("SELECT * FROM trades ORDER BY id DESC LIMIT 100").all(); return json({trades:r.results||[]});
   }
   if(path==="/api/trades/open" && req.method==="POST") {
+    if (!authorized(req, env)) return json({error:"Non autorizzato: configura BOT_TOKEN e invia Authorization: Bearer <token>."},401);
     const body=await req.json().catch(()=>null);
     const id=Number(body?.signalId);
     if(!Number.isInteger(id)||id<1) return json({error:"signalId non valido"},400);
     const sig=await env.DB.prepare("SELECT * FROM signals WHERE id=?").bind(id).first();
     if(!sig||!sig.candidate||sig.status!=="new") return json({error:"Segnale non disponibile o non più valido"},409);
     const already=await env.DB.prepare("SELECT COUNT(*) n FROM trades WHERE status='open'").first();
-    if(Number(already?.n)>=2) return json({error:"Massimo 2 posizioni aperte"},409);
+    if(Number(already?.n)>=MAX_OPEN_TRADES) return json({error:"Massimo 3 posizioni aperte"},409);
     const openAt=Number(sig.price), stop=Math.min(Number(sig.resistance)*.99,openAt*.97);
     if(!(openAt>stop&&stop>0)) return json({error:"Prezzi non validi per lo stop"},400);
-    const riskBudget=1.5, size=Math.min(150,riskBudget/((openAt-stop)/openAt+FEE_RATE*2));
+    const size=positionSize({capital:STARTING_EUR,riskEur:MAX_RISK_EUR,entry:openAt,stop,feeRate:FEE_RATE});
     if(!(size>0)) return json({error:"Dimensione posizione non valida"},400);
+    const today = new Date().toISOString().slice(0,10);
+    const daily = await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN pnl_eur < 0 THEN -pnl_eur ELSE 0 END),0) loss FROM trades WHERE status='closed' AND substr(closed_at,1,10)=?").bind(today).first();
+    if (Number(daily?.loss || 0) >= DAILY_LOSS_LIMIT_EUR) return json({error:"Limite di perdita giornaliera raggiunto; nuove aperture bloccate fino a domani."},409);
     const target=openAt+(openAt-stop)*2, now=new Date().toISOString();
     const result=await env.DB.prepare("INSERT INTO trades(signal_id,symbol,entry,stop,target,size_eur,fee_rate,status,opened_at) VALUES(?,?,?,?,?,?,?,'open',?)")
       .bind(id,sig.symbol,openAt,stop,target,size,FEE_RATE,now).run();
@@ -174,6 +204,8 @@ async function route(req, env) {
   }
   return json({error:"Endpoint non trovato"},404);
 }
+export { marketPrice, isSpotInstrument, positionSize };
+
 export default {
   async fetch(request, env) {
     try { return await route(request,env); }
