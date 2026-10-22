@@ -36,8 +36,17 @@ Questa repo include il backend paper-only in `worker.js`, schema SQL in `schema.
 5. In **Settings → Triggers**, imposta un Cron Trigger `*/5 * * * *` (ogni 5 minuti). Il piano gratuito ha quote e limiti: consulta il pannello Cloudflare per i limiti attuali.
 6. Il Worker avrà un URL simile a `https://crypto-momentum-paper-bot.<tuo-account>.workers.dev`. Conserva quell'URL; il frontend GitHub Pages va collegato a esso per mostrare dati live e inviare le azioni paper. La configurazione Wrangler qui è un modello: sostituisci il database ID prima di usarla.
 
+### Autenticazione obbligatoria del backend
+
+Il Worker richiede un secret Cloudflare chiamato `BOT_TOKEN` per **tutti** gli endpoint `/api/*`. Prima del deploy, imposta il secret con Wrangler (`npx wrangler secret put BOT_TOKEN`) oppure dalla dashboard Cloudflare → Worker → Settings → Variables and Secrets. Usa un token casuale lungo e non salvarlo nel repository. Nel frontend inserisci lo stesso token nella sezione backend. Il browser lo salva nel local storage del dispositivo; chiunque abbia accesso a quel dispositivo/browser potrebbe leggerlo. Non condividere il token.
+
 ### Limiti importanti
 - Il piano gratuito è adatto a un prototipo, non garantisce SLA o continuità assoluta. Le scansioni possono fallire per quote, manutenzione, rate limit o indisponibilità di Crypto.com.
 - Il job ogni 5 minuti non osserva ogni tick: uno spike rapido o un gap può non essere rilevato; l'uscita simulata usa l'ultimo prezzo rilevato dal job.
 - Il modello di prezzo, spread e commissioni è semplificato; le prestazioni simulate non dimostrano redditività reale.
-- Il backend è in modalità paper trading. Prima di renderlo accessibile pubblicamente, aggiungere autenticazione o un token segreto per impedire ad altri di aprire posizioni sul tuo portafoglio. Non collegare API key di exchange.
+- Il backend è in modalità paper trading. L’autenticazione con `BOT_TOKEN` è obbligatoria sugli endpoint API, ma non sostituisce una revisione di sicurezza e gestione dei segreti prima di un uso prolungato. Non collegare API key di exchange.
+
+
+## Test automatici
+
+Con Node.js 22 o successivo, esegui `npm test`. I test verificano il parsing del prezzo ticker, il filtro strumenti spot e il dimensionamento in base al rischio. GitHub Actions esegue gli stessi test a ogni push e pull request. Sono test di regressione del codice, non una validazione della strategia né un backtest di redditività.
