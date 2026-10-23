@@ -147,10 +147,13 @@ async function scanMarkets(db) {
     await manageOpenTrades(db, tickers);
     await setState(db,"last_scan",now);
     await setState(db,"last_error","");
-    await setState(db,"scan_count",Number(await getState(db,"scan_count"))+1);
+    const scanCount = Number(await getState(db,"scan_count"))+1;
+    await setState(db,"scan_count",scanCount);
+    console.log("Scheduled scan completed", JSON.stringify({at:now,scanCount,markets:eligible.length,analyzed:results.length,candidates:results.filter(x=>x.candidate).length}));
     return {ok:true,markets:eligible.length,analyzed:results.length,candidates:results.filter(x=>x.candidate).length,at:now};
   } catch(e) {
     await setState(db,"last_error",String(e?.message||e));
+    console.error("Scheduled scan failed", String(e?.message||e));
     throw e;
   }
 }
