@@ -8,4 +8,4 @@ crons = ["*/5 * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "crypto-momentum-paper-bot"
-database_id ="b1d1189b-143e-4a5d-8a59-ca2ec2cd5727"
+database_id = "b1d1189b-143e-4a5d-8a59-ca2ec2cd5727"
